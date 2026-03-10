@@ -262,7 +262,11 @@ def add_seed_features(team_stats: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_massey_features(team_stats: pd.DataFrame) -> pd.DataFrame:
-    """Merge Massey ordinal rankings (KenPom, Sagarin) into team stats."""
+    """Merge Massey ordinal rankings into team stats.
+
+    Includes KenPom, Sagarin individual rankings plus a composite mean
+    rank across all systems with 18+ seasons of coverage.
+    """
     massey = load_massey_ordinals()
 
     # Pivot: one column per ranking system
@@ -274,7 +278,37 @@ def add_massey_features(team_stats: pd.DataFrame) -> pd.DataFrame:
     pivot.columns.name = None
     pivot = pivot.rename(columns={"POM": "OrdinalKenPom", "SAG": "OrdinalSagarin"})
 
-    return team_stats.merge(pivot, on=["Season", "TeamID"], how="left")
+    team_stats = team_stats.merge(pivot, on=["Season", "TeamID"], how="left")
+
+    # Composite ranking: mean rank across all systems with 18+ seasons
+    composite = _build_composite_ranking()
+    team_stats = team_stats.merge(composite, on=["Season", "TeamID"], how="left")
+
+    return team_stats
+
+
+def _build_composite_ranking(min_seasons: int = 18) -> pd.DataFrame:
+    """Build composite ranking from all Massey systems with sufficient coverage."""
+    from config import DATA_DIR, FIRST_DETAILED_SEASON, TOURNEY_START_DAY
+
+    massey = pd.read_csv(DATA_DIR / "MMasseyOrdinals.csv")
+    massey = massey[(massey["Season"] >= FIRST_DETAILED_SEASON)
+                    & (massey["RankingDayNum"] <= TOURNEY_START_DAY)]
+
+    # Keep latest ranking per system/season/team
+    idx = massey.groupby(["Season", "SystemName", "TeamID"])["RankingDayNum"].idxmax()
+    massey = massey.loc[idx]
+
+    # Filter to systems with sufficient coverage
+    season_counts = massey.groupby("SystemName")["Season"].nunique()
+    good_systems = season_counts[season_counts >= min_seasons].index.tolist()
+    massey = massey[massey["SystemName"].isin(good_systems)]
+
+    # Mean rank across all available systems
+    composite = massey.groupby(["Season", "TeamID"])["OrdinalRank"].mean().reset_index()
+    composite.columns = ["Season", "TeamID", "CompositeRank"]
+
+    return composite
 
 
 def compute_matchup_differentials(matchup_df: pd.DataFrame,
@@ -325,7 +359,7 @@ def compute_matchup_differentials(matchup_df: pd.DataFrame,
             row[f"{stat}Diff"] = a_val - b_val
 
         # Massey ordinal differentials (lower rank = better, so B - A)
-        for col in ["OrdinalKenPom", "OrdinalSagarin"]:
+        for col in ["OrdinalKenPom", "OrdinalSagarin", "CompositeRank"]:
             a_val = a.get(col, 180)
             b_val = b.get(col, 180)
             if pd.isna(a_val):

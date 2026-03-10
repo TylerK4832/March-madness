@@ -94,6 +94,12 @@ FEATURE_TIERS = {
         "ORPctDiff",
         "FTRateDiff",
     ],
+    "efficiency_composite": [
+        "SeedDiff",
+        "OEDiff",
+        "DEDiff",
+        "CompositeRankDiff",
+    ],
 }
 
 # MLflow settings

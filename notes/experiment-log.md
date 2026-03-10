@@ -22,15 +22,25 @@ The single biggest improvement over seed-only. Points per 100 possessions strips
 ### Stacking ensemble
 LR + RF + GBM base models with logistic meta-learner and passthrough. Consistently +1% over logistic on the same features. The only model complexity that actually helped.
 
-### Prediction blending (log loss only)
-Averaging predictions from diverse models improves calibration but not accuracy.
+### Composite Massey ranking (H2)
+Mean rank across 23 ranking systems with 18+ seasons of coverage. Provides robust "expert consensus" signal orthogonal to raw efficiency. Strongest single-feature addition we've found. Stronger regularization (C=0.05) helps logistic regression with this feature.
+
+| Model | Tier | Accuracy | Log Loss |
+|-------|------|----------|----------|
+| LR (C=0.05) | efficiency_composite (Seed+OE+DE+Composite) | **70.95%** | **0.5661** |
+| Stacking | efficiency_composite | 70.95% | 0.5697 |
+| LR | Seed+Composite only | 70.33% | 0.5718 |
+
+Key insight: composite rank helps LR close the gap to stacking because it provides a strong linear signal that stacking's trees were capturing non-linearly from other features.
+
+### Model blending (H8)
+Blending stacking(efficiency) + LR(efficiency_composite, C=0.05). These two models have complementary strengths: stacking wins accuracy, LR+composite wins log loss. **New best accuracy.**
 
 | Blend | Accuracy | Log Loss |
 |-------|----------|----------|
-| 60% stacking_eff + 40% LR_base_massey | 70.77% | **0.5680** |
-| 4-way average | 69.97% | 0.5682 |
-
-Best log loss, but accuracy stayed at or below stacking alone.
+| 70% stacking + 30% LR(composite) | **71.30%** | 0.5679 |
+| 60% stacking + 40% LR(composite) | 71.12% | 0.5674 |
+| 30% stacking + 70% LR(composite) | 71.04% | **0.5663** |
 
 ## What Didn't Work
 
@@ -67,8 +77,35 @@ Consistently underperformed logistic regression. ~660 training games per fold is
 | XGBoost | efficiency | 66.16% | 0.6247 |
 | XGBoost | efficiency_4f | 66.96% | 0.6297 |
 
+### Strong regularization with richer features (H3)
+**Hypothesis:** Stronger regularization (low C) could let logistic regression use more features without overfitting.
+**Result:** Confirmed. C=0.05 is optimal for efficiency_composite (4 features). Also rescues larger feature sets: base_massey goes from 69.71% to 70.33% at C=0.05, full goes from 69.26% to 70.06% at C=0.01. However, no combination beats efficiency_composite at C=0.05. Stacking is insensitive to meta-learner regularization.
+
+| Model | Tier | C | Accuracy | Log Loss |
+|-------|------|---|----------|----------|
+| LR | efficiency_composite | 0.05 | 70.95% | 0.5661 |
+| LR | base_massey | 0.05 | 70.33% | 0.5698 |
+| LR | full (17 features) | 0.01 | 70.06% | 0.5718 |
+
+### Historical seed win rate via pipeline (H9)
+**Hypothesis:** Per-fold historical seed matchup win rates (computed only from training data via pipeline) would improve predictions.
+**Result:** Hurts across the board. Without leakage, per-fold sample sizes per seed differential are too small to be reliable. The earlier "improvement" (0.5702 → 0.5580 log loss) was entirely data leakage. Good validation that the pipeline prevents this.
+
+### Isotonic calibration (H5)
+**Hypothesis:** Post-hoc isotonic regression would improve log loss without changing accuracy.
+**Result:** Hurts both metrics. Logistic regression already outputs well-calibrated probabilities. Isotonic regression overfits on the small training calibration set (~660 games).
+
+| Model | Raw LL | Calibrated LL | Delta |
+|-------|--------|---------------|-------|
+| Stacking | 0.5702 | 0.5815 | +0.0113 (worse) |
+| LR+composite | 0.5661 | 0.5807 | +0.0146 (worse) |
+
+### Non-linear seed encoding (H1)
+**Hypothesis:** SeedDiff² or historical seed win rates would capture the non-linear seed-win relationship.
+**Result:** No accuracy improvement. SeedDiff², SeedDiff³, |SeedDiff| all hurt. Historical seed win rate showed large log loss improvement but was initially computed with data leakage; needs per-fold computation via pipeline (now possible). Logistic regression's sigmoid already captures non-linearity; stacking's trees learn it natively.
+
 ### More features in general
-Kitchen-sink approaches (11+ features) always hurt. Multicollinearity is the enemy with small datasets. The best feature set is the smallest: Seed + OE + DE.
+Kitchen-sink approaches (11+ features) always hurt. Multicollinearity is the enemy with small datasets. The best feature set is the smallest: Seed + OE + DE (+ CompositeRank).
 
 ### Threshold tuning
 Default 0.50 is already optimal. Tested 0.45-0.55 range, no improvement.
