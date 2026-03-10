@@ -31,39 +31,56 @@ def build_team_season_stats() -> pd.DataFrame:
     l_stats = l_stats.rename(columns={**l_rename, **w_rename})
     l_stats["Won"] = 0
 
-    # Actually let's take a cleaner approach
     # For each game, compute stats from both teams' perspectives
     records = []
     for _, row in rs.iterrows():
         season = row["Season"]
-        # Winner record
-        records.append({
-            "Season": season, "TeamID": row["WTeamID"],
-            "Won": 1,
-            "Score": row["WScore"], "OppScore": row["LScore"],
-            "FGM": row["WFGM"], "FGA": row["WFGA"],
-            "FGM3": row["WFGM3"], "FGA3": row["WFGA3"],
-            "FTM": row["WFTM"], "FTA": row["WFTA"],
-            "OR": row["WOR"], "DR": row["WDR"],
-            "Ast": row["WAst"], "TO": row["WTO"],
-            "Stl": row["WStl"], "Blk": row["WBlk"],
-            "OppOR": row["LOR"], "OppDR": row["LDR"],
-            "OppTO": row["LTO"],
-        })
-        # Loser record
-        records.append({
-            "Season": season, "TeamID": row["LTeamID"],
-            "Won": 0,
-            "Score": row["LScore"], "OppScore": row["WScore"],
-            "FGM": row["LFGM"], "FGA": row["LFGA"],
-            "FGM3": row["LFGM3"], "FGA3": row["LFGA3"],
-            "FTM": row["LFTM"], "FTA": row["LFTA"],
-            "OR": row["LOR"], "DR": row["LDR"],
-            "Ast": row["LAst"], "TO": row["LTO"],
-            "Stl": row["LStl"], "Blk": row["LBlk"],
-            "OppOR": row["WOR"], "OppDR": row["WDR"],
-            "OppTO": row["WTO"],
-        })
+        for is_winner in [True, False]:
+            p = "W" if is_winner else "L"
+            o = "L" if is_winner else "W"
+
+            fga = row[f"{p}FGA"]
+            fta = row[f"{p}FTA"]
+            orb = row[f"{p}OR"]
+            to = row[f"{p}TO"]
+            ofga = row[f"{o}FGA"]
+            ofta = row[f"{o}FTA"]
+            oorb = row[f"{o}OR"]
+            oto = row[f"{o}TO"]
+
+            # Estimate possessions (Dean Oliver formula)
+            orb_pct = orb / max(orb + row[f"{o}DR"], 1)
+            oorb_pct = oorb / max(oorb + row[f"{p}DR"], 1)
+            poss = 0.5 * (
+                (fga + 0.4 * fta - 1.07 * orb_pct * (fga - row[f"{p}FGM"]) + to)
+                + (ofga + 0.4 * ofta - 1.07 * oorb_pct * (ofga - row[f"{o}FGM"]) + oto)
+            )
+            if poss < 1:
+                poss = 60
+
+            records.append({
+                "Season": season, "DayNum": row["DayNum"],
+                "TeamID": row[f"{p}TeamID"],
+                "OppID": row[f"{o}TeamID"],
+                "Won": 1 if is_winner else 0,
+                "Score": row[f"{p}Score"], "OppScore": row[f"{o}Score"],
+                "FGM": row[f"{p}FGM"], "FGA": fga,
+                "FGM3": row[f"{p}FGM3"], "FGA3": row[f"{p}FGA3"],
+                "FTM": row[f"{p}FTM"], "FTA": fta,
+                "OR": orb, "DR": row[f"{p}DR"],
+                "Ast": row[f"{p}Ast"], "TO": to,
+                "Stl": row[f"{p}Stl"], "Blk": row[f"{p}Blk"],
+                "OppOR": oorb, "OppDR": row[f"{o}DR"],
+                "OppTO": oto,
+                # Tempo-adjusted stats
+                "Poss": poss,
+                "OE": row[f"{p}Score"] / poss * 100,
+                "DE": row[f"{o}Score"] / poss * 100,
+                "eFGPct": (row[f"{p}FGM"] + 0.5 * row[f"{p}FGM3"]) / max(fga, 1),
+                "TOPct": to / max(poss, 1),
+                "ORPct": orb / max(orb + row[f"{o}DR"], 1),
+                "FTRate": fta / max(fga, 1),
+            })
 
     game_df = pd.DataFrame(records)
 
@@ -88,6 +105,13 @@ def build_team_season_stats() -> pd.DataFrame:
         OppOR=("OppOR", "mean"),
         OppDR=("OppDR", "mean"),
         OppTO=("OppTO", "mean"),
+        Poss=("Poss", "mean"),
+        OE=("OE", "mean"),
+        DE=("DE", "mean"),
+        eFGPct=("eFGPct", "mean"),
+        TOPct=("TOPct", "mean"),
+        ORPct=("ORPct", "mean"),
+        FTRate=("FTRate", "mean"),
     ).reset_index()
 
     # Derived features
@@ -98,6 +122,7 @@ def build_team_season_stats() -> pd.DataFrame:
     agg["FTPct"] = agg["FTM"] / agg["FTA"].clip(lower=1)
     agg["TOMargin"] = agg["OppTO"] - agg["TO"]  # positive = good
     agg["RebMargin"] = (agg["OR"] + agg["DR"]) - (agg["OppOR"] + agg["OppDR"])
+    agg["NetEff"] = agg["OE"] - agg["DE"]
 
     # Strength of schedule proxy: average opponent scoring margin
     # (will be zero-ish by construction for synthetic data but works with real data)
@@ -106,7 +131,128 @@ def build_team_season_stats() -> pd.DataFrame:
     ).reset_index()
     agg = agg.merge(sos, on=["Season", "TeamID"], how="left")
 
+    # Opponent-adjusted efficiency
+    adj = compute_adjusted_efficiency(game_df)
+    agg = agg.merge(adj, on=["Season", "TeamID"], how="left")
+
+    # Late-season momentum: last 10 games before tournament
+    late = compute_late_season_stats(game_df)
+    agg = agg.merge(late, on=["Season", "TeamID"], how="left")
+
+    # Consistency and close-game stats
+    extra = compute_consistency_stats(game_df)
+    agg = agg.merge(extra, on=["Season", "TeamID"], how="left")
+
     return agg
+
+
+def compute_adjusted_efficiency(game_df: pd.DataFrame, n_iterations: int = 20) -> pd.DataFrame:
+    """Compute opponent-adjusted offensive/defensive efficiency per team-season.
+
+    Uses iterative adjustment: each team's raw efficiency is adjusted based on
+    the quality of opponents faced. A team scoring 100 pts/100poss against a
+    defense that allows 95 (below avg) is better than one scoring 105 against
+    a defense that allows 115 (above avg).
+
+    Similar in spirit to KenPom's adjusted efficiency.
+    """
+    results = []
+
+    for season, sdf in game_df.groupby("Season"):
+        teams = sdf["TeamID"].unique()
+
+        league_oe = sdf["OE"].mean()
+        league_de = sdf["DE"].mean()
+
+        # Initialize ratings at league average
+        adj_oe = {t: league_oe for t in teams}
+        adj_de = {t: league_de for t in teams}
+
+        for _ in range(n_iterations):
+            new_oe = {t: [] for t in teams}
+            new_de = {t: [] for t in teams}
+
+            for _, g in sdf.iterrows():
+                tid = g["TeamID"]
+                oid = int(g.get("OppID", 0))
+                if oid == 0:
+                    # Need opponent ID - infer from game structure
+                    continue
+                if oid not in adj_de:
+                    continue
+
+                opp_de_factor = adj_de[oid] / league_de
+                opp_oe_factor = adj_oe[oid] / league_oe
+
+                # Adjust: what would this team score/allow vs average opponent?
+                new_oe[tid].append(g["OE"] / opp_de_factor)
+                new_de[tid].append(g["DE"] / opp_oe_factor)
+
+            for t in teams:
+                if new_oe[t]:
+                    adj_oe[t] = np.mean(new_oe[t])
+                if new_de[t]:
+                    adj_de[t] = np.mean(new_de[t])
+
+        for t in teams:
+            results.append({
+                "Season": season,
+                "TeamID": t,
+                "AdjOE": adj_oe[t],
+                "AdjDE": adj_de[t],
+                "AdjNetEff": adj_oe[t] - adj_de[t],
+            })
+
+    return pd.DataFrame(results)
+
+
+def compute_late_season_stats(game_df: pd.DataFrame, n_games: int = 10) -> pd.DataFrame:
+    """Compute stats from the last N regular season games (momentum/form).
+
+    Captures late-season form: teams peaking at the right time often outperform
+    their season averages in March.
+    """
+    from config import TOURNEY_START_DAY
+
+    results = []
+    for (season, tid), gdf in game_df.groupby(["Season", "TeamID"]):
+        # Only pre-tournament games
+        pre_tourney = gdf[gdf["DayNum"] < TOURNEY_START_DAY].sort_values("DayNum")
+        if len(pre_tourney) < 5:
+            continue
+        last_n = pre_tourney.tail(n_games)
+        results.append({
+            "Season": season,
+            "TeamID": tid,
+            "LateWinPct": last_n["Won"].mean(),
+            "LateOE": last_n["OE"].mean(),
+            "LateDE": last_n["DE"].mean(),
+            "LateMargin": (last_n["Score"] - last_n["OppScore"]).mean(),
+        })
+    return pd.DataFrame(results)
+
+
+def compute_consistency_stats(game_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute consistency and close-game performance metrics.
+
+    - OE/DE variance: more consistent teams may be more reliable in single-elimination
+    - Close game win%: teams that win close games may have a mental edge
+    """
+    results = []
+    for (season, tid), gdf in game_df.groupby(["Season", "TeamID"]):
+        margin = gdf["Score"] - gdf["OppScore"]
+        close_mask = margin.abs() <= 5  # close games within 5 points
+        close_games = gdf[close_mask]
+
+        results.append({
+            "Season": season,
+            "TeamID": tid,
+            "OEStd": gdf["OE"].std(),
+            "MarginStd": margin.std(),
+            "CloseWinPct": close_games["Won"].mean() if len(close_games) >= 3 else 0.5,
+            "CloseGamePct": len(close_games) / len(gdf),  # fraction of games that are close
+        })
+    return pd.DataFrame(results)
 
 
 def add_seed_features(team_stats: pd.DataFrame) -> pd.DataFrame:
@@ -204,7 +350,11 @@ def build_matchup_features(feature_tier: str = "full") -> tuple[pd.DataFrame, pd
             row[f"{col}Diff"] = b_val - a_val  # positive = A ranked better
 
         # Derived differentials
-        for stat in ["TOMargin", "RebMargin", "SoSProxy"]:
+        for stat in ["TOMargin", "RebMargin", "SoSProxy",
+                      "OE", "DE", "NetEff", "eFGPct", "TOPct", "ORPct", "FTRate",
+                      "AdjOE", "AdjDE", "AdjNetEff",
+                      "LateWinPct", "LateOE", "LateDE", "LateMargin",
+                      "OEStd", "MarginStd", "CloseWinPct", "CloseGamePct"]:
             a_val = a.get(stat, 0)
             b_val = b.get(stat, 0)
             if pd.isna(a_val):

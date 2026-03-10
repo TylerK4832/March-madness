@@ -7,6 +7,10 @@ build/
 
 # Data files (download from Kaggle or generate with scripts/generate_synthetic_data.py)
 data/*.csv
+data/*.zip
+
+# Saved model artifacts
+/models/
 
 # MLflow artifacts
 mlruns/
@@ -21,4 +25,5 @@ Thumbs.db
 
 # Virtual environments
 venv/
+.venv/
 .env/

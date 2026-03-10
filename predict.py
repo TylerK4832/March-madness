@@ -61,7 +61,9 @@ def build_tournament_matchup_probs(model, team_stats, feature_cols, season, tour
                 b_val = b_stats.get(col, 180)
                 row[f"{col}Diff"] = (b_val if not pd.isna(b_val) else 180) - (a_val if not pd.isna(a_val) else 180)
 
-            for stat in ["TOMargin", "RebMargin", "SoSProxy"]:
+            for stat in ["TOMargin", "RebMargin", "SoSProxy",
+                         "OE", "DE", "NetEff", "eFGPct", "TOPct", "ORPct", "FTRate",
+                         "AdjOE", "AdjDE", "AdjNetEff"]:
                 a_val = a_stats.get(stat, 0)
                 b_val = b_stats.get(stat, 0)
                 row[f"{stat}Diff"] = (a_val if not pd.isna(a_val) else 0) - (b_val if not pd.isna(b_val) else 0)

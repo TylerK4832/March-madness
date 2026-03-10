@@ -66,6 +66,34 @@ FEATURE_TIERS = {
         "RebMarginDiff",
         "SoSProxyDiff",
     ],
+    "efficiency": [
+        "SeedDiff",
+        "OEDiff",
+        "DEDiff",
+    ],
+    "efficiency_4f": [
+        "SeedDiff",
+        "OEDiff",
+        "DEDiff",
+        "eFGPctDiff",
+        "TOPctDiff",
+        "ORPctDiff",
+        "FTRateDiff",
+    ],
+    "adj_efficiency": [
+        "SeedDiff",
+        "AdjOEDiff",
+        "AdjDEDiff",
+    ],
+    "adj_efficiency_4f": [
+        "SeedDiff",
+        "AdjOEDiff",
+        "AdjDEDiff",
+        "eFGPctDiff",
+        "TOPctDiff",
+        "ORPctDiff",
+        "FTRateDiff",
+    ],
 }
 
 # MLflow settings
