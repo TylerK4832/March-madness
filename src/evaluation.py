@@ -1,9 +1,9 @@
-"""Evaluation: log loss, accuracy, upset accuracy, walk-forward and LOSO CV."""
+"""Evaluation: log loss, accuracy, upset accuracy, walk-forward and sliding window CV."""
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss, accuracy_score
-from src.models.base import BaseModel
+from sklearn.pipeline import Pipeline
 
 
 def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray,
@@ -41,53 +41,63 @@ def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray,
     return metrics
 
 
-def leave_one_season_out_cv(
-    model_cls: type,
-    model_kwargs: dict,
-    X: pd.DataFrame,
-    y: pd.Series,
-    seasons: pd.Series,
-    feature_cols: list[str] | None = None,
-) -> dict:
-    """Leave-one-season-out cross-validation.
+def _get_seed_diffs(X: pd.DataFrame) -> np.ndarray | None:
+    """Extract seed diffs from either a feature matrix or raw matchup rows."""
+    if "SeedDiff" in X.columns:
+        return X["SeedDiff"].values
+    return None
 
-    Returns aggregated metrics and per-season breakdown.
-    """
+
+def _fit_predict(model_cls, model_kwargs, pipeline_factory,
+                 X_train, y_train, X_test):
+    """Fit a model or pipeline and return P(TeamA wins) as 1-D array."""
+    if pipeline_factory is not None:
+        pipe = pipeline_factory()
+        pipe.fit(X_train, y_train)
+        y_prob = pipe.predict_proba(X_test)[:, 1]
+    else:
+        model = model_cls(**model_kwargs)
+        model.fit(X_train, y_train)
+        y_prob = model.predict_proba(X_test)
+    return np.clip(y_prob, 0.01, 0.99)
+
+
+def leave_one_season_out_cv(
+    model_cls: type = None,
+    model_kwargs: dict = None,
+    X: pd.DataFrame = None,
+    y: pd.Series = None,
+    seasons: pd.Series = None,
+    seed_diffs: np.ndarray | None = None,
+    pipeline_factory: callable = None,
+) -> dict:
+    """Leave-one-season-out cross-validation."""
     unique_seasons = sorted(seasons.unique())
-    all_y_true = []
-    all_y_prob = []
-    all_seed_diffs = []
+    all_y_true, all_y_prob, all_seed_diffs = [], [], []
     per_season = []
 
     for held_out in unique_seasons:
         train_mask = seasons != held_out
         test_mask = seasons == held_out
-
-        X_train = X[train_mask]
-        y_train = y[train_mask]
-        X_test = X[test_mask]
-        y_test = y[test_mask]
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test, y_test = X[test_mask], y[test_mask]
 
         if len(y_test) == 0 or len(y_train) == 0:
             continue
 
-        model = model_cls(**model_kwargs)
-        model.fit(X_train, y_train)
-        y_prob = model.predict_proba(X_test)
+        y_prob = _fit_predict(model_cls, model_kwargs, pipeline_factory,
+                              X_train, y_train, X_test)
 
-        # Clip probabilities for log loss stability
-        y_prob = np.clip(y_prob, 0.01, 0.99)
+        sd = seed_diffs[test_mask.values] if seed_diffs is not None else _get_seed_diffs(X_test)
 
-        seed_diffs = X_test["SeedDiff"].values if "SeedDiff" in X_test.columns else None
-
-        metrics = compute_metrics(y_test.values, y_prob, seed_diffs)
+        metrics = compute_metrics(y_test.values, y_prob, sd)
         metrics["season"] = held_out
         per_season.append(metrics)
 
         all_y_true.extend(y_test.values)
         all_y_prob.extend(y_prob)
-        if seed_diffs is not None:
-            all_seed_diffs.extend(seed_diffs)
+        if sd is not None:
+            all_seed_diffs.extend(sd)
 
     all_y_true = np.array(all_y_true)
     all_y_prob = np.array(all_y_prob)
@@ -96,20 +106,19 @@ def leave_one_season_out_cv(
     overall = compute_metrics(all_y_true, all_y_prob, all_seed_diffs)
     overall["n_seasons"] = len(unique_seasons)
 
-    return {
-        "overall": overall,
-        "per_season": per_season,
-    }
+    return {"overall": overall, "per_season": per_season}
 
 
 def sliding_window_cv(
-    model_cls: type,
-    model_kwargs: dict,
-    X: pd.DataFrame,
-    y: pd.Series,
-    seasons: pd.Series,
+    model_cls: type = None,
+    model_kwargs: dict = None,
+    X: pd.DataFrame = None,
+    y: pd.Series = None,
+    seasons: pd.Series = None,
     window_size: int | None = None,
     min_train_seasons: int = 5,
+    seed_diffs: np.ndarray | None = None,
+    pipeline_factory: callable = None,
 ) -> dict:
     """Sliding window cross-validation: train on a fixed window of recent seasons.
 
@@ -117,17 +126,24 @@ def sliding_window_cv(
     If window_size is None, uses all prior data (expanding window = walk-forward).
 
     Args:
+        model_cls: BaseModel subclass. Not needed if pipeline_factory is provided.
+        model_kwargs: Kwargs for model_cls. Not needed if pipeline_factory is provided.
+        X: Feature DataFrame (precomputed differentials) or raw matchup rows
+           (Season, TeamA, TeamB) if using pipeline_factory.
+        y: Labels.
+        seasons: Season for each row.
         window_size: Number of prior seasons to train on. None = expanding window.
         min_train_seasons: Minimum training seasons required before evaluating.
+        seed_diffs: Precomputed seed diffs for upset detection. If None, attempts
+                    to extract from X columns.
+        pipeline_factory: Callable that returns a fresh Pipeline. If provided,
+                         model_cls/model_kwargs are ignored.
     """
     unique_seasons = sorted(seasons.unique())
-
-    all_y_true = []
-    all_y_prob = []
-    all_seed_diffs = []
+    all_y_true, all_y_prob, all_seed_diffs = [], [], []
     per_season = []
 
-    for i, held_out in enumerate(unique_seasons):
+    for held_out in unique_seasons:
         prior_seasons = [s for s in unique_seasons if s < held_out]
         if len(prior_seasons) < min_train_seasons:
             continue
@@ -139,32 +155,26 @@ def sliding_window_cv(
             train_mask = seasons < held_out
 
         test_mask = seasons == held_out
-
-        X_train = X[train_mask]
-        y_train = y[train_mask]
-        X_test = X[test_mask]
-        y_test = y[test_mask]
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test, y_test = X[test_mask], y[test_mask]
 
         if len(y_test) == 0 or len(y_train) == 0:
             continue
 
-        model = model_cls(**model_kwargs)
-        model.fit(X_train, y_train)
-        y_prob = model.predict_proba(X_test)
+        y_prob = _fit_predict(model_cls, model_kwargs, pipeline_factory,
+                              X_train, y_train, X_test)
 
-        y_prob = np.clip(y_prob, 0.01, 0.99)
+        sd = seed_diffs[test_mask.values] if seed_diffs is not None else _get_seed_diffs(X_test)
 
-        seed_diffs = X_test["SeedDiff"].values if "SeedDiff" in X_test.columns else None
-
-        metrics = compute_metrics(y_test.values, y_prob, seed_diffs)
+        metrics = compute_metrics(y_test.values, y_prob, sd)
         metrics["season"] = held_out
         metrics["n_train"] = len(y_train)
         per_season.append(metrics)
 
         all_y_true.extend(y_test.values)
         all_y_prob.extend(y_prob)
-        if seed_diffs is not None:
-            all_seed_diffs.extend(seed_diffs)
+        if sd is not None:
+            all_seed_diffs.extend(sd)
 
     all_y_true = np.array(all_y_true)
     all_y_prob = np.array(all_y_prob)
@@ -173,68 +183,55 @@ def sliding_window_cv(
     overall = compute_metrics(all_y_true, all_y_prob, all_seed_diffs)
     overall["n_seasons"] = len(per_season)
 
-    return {
-        "overall": overall,
-        "per_season": per_season,
-    }
+    return {"overall": overall, "per_season": per_season}
 
 
 def walk_forward_cv(
-    model_cls: type,
-    model_kwargs: dict,
-    X: pd.DataFrame,
-    y: pd.Series,
-    seasons: pd.Series,
+    model_cls: type = None,
+    model_kwargs: dict = None,
+    X: pd.DataFrame = None,
+    y: pd.Series = None,
+    seasons: pd.Series = None,
     test_seasons: list[int] | None = None,
+    seed_diffs: np.ndarray | None = None,
+    pipeline_factory: callable = None,
 ) -> dict:
     """Walk-forward cross-validation: train on past, predict each test season.
 
     Only uses data from seasons strictly before the held-out season for training.
     This mirrors real-world usage (no future data leakage).
-
-    Args:
-        test_seasons: Seasons to evaluate on. Defaults to last 3 seasons.
     """
     unique_seasons = sorted(seasons.unique())
 
     if test_seasons is None:
         test_seasons = unique_seasons[-3:]
 
-    all_y_true = []
-    all_y_prob = []
-    all_seed_diffs = []
+    all_y_true, all_y_prob, all_seed_diffs = [], [], []
     per_season = []
 
     for held_out in test_seasons:
         train_mask = seasons < held_out
         test_mask = seasons == held_out
-
-        X_train = X[train_mask]
-        y_train = y[train_mask]
-        X_test = X[test_mask]
-        y_test = y[test_mask]
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test, y_test = X[test_mask], y[test_mask]
 
         if len(y_test) == 0 or len(y_train) == 0:
             continue
 
-        model = model_cls(**model_kwargs)
-        model.fit(X_train, y_train)
-        y_prob = model.predict_proba(X_test)
+        y_prob = _fit_predict(model_cls, model_kwargs, pipeline_factory,
+                              X_train, y_train, X_test)
 
-        # Clip probabilities for log loss stability
-        y_prob = np.clip(y_prob, 0.01, 0.99)
+        sd = seed_diffs[test_mask.values] if seed_diffs is not None else _get_seed_diffs(X_test)
 
-        seed_diffs = X_test["SeedDiff"].values if "SeedDiff" in X_test.columns else None
-
-        metrics = compute_metrics(y_test.values, y_prob, seed_diffs)
+        metrics = compute_metrics(y_test.values, y_prob, sd)
         metrics["season"] = held_out
         metrics["n_train"] = len(y_train)
         per_season.append(metrics)
 
         all_y_true.extend(y_test.values)
         all_y_prob.extend(y_prob)
-        if seed_diffs is not None:
-            all_seed_diffs.extend(seed_diffs)
+        if sd is not None:
+            all_seed_diffs.extend(sd)
 
     all_y_true = np.array(all_y_true)
     all_y_prob = np.array(all_y_prob)
@@ -243,7 +240,4 @@ def walk_forward_cv(
     overall = compute_metrics(all_y_true, all_y_prob, all_seed_diffs)
     overall["n_seasons"] = len(test_seasons)
 
-    return {
-        "overall": overall,
-        "per_season": per_season,
-    }
+    return {"overall": overall, "per_season": per_season}

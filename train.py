@@ -18,11 +18,12 @@ import pandas as pd
 sys.path.insert(0, ".")
 
 from config import FEATURE_TIERS
-from src.feature_engineering import build_matchup_features
+from src.feature_engineering import build_matchup_rows, compute_matchup_differentials
 from src.models import MODEL_REGISTRY
 from src.evaluation import leave_one_season_out_cv, walk_forward_cv, sliding_window_cv
 from src.experiment import log_experiment
 from src.model_store import save_model, print_model_library
+from src.pipeline import make_pipeline
 
 
 def run_experiment(model_name: str, model_kwargs: dict, feature_tier: str,
@@ -33,29 +34,52 @@ def run_experiment(model_name: str, model_kwargs: dict, feature_tier: str,
     print(f"Experiment: {model_name} | tier: {feature_tier} | cv: {cv_method}")
     print(f"{'='*60}")
 
-    # Build features
-    print("  Building matchup features...")
-    X, y, seasons = build_matchup_features(feature_tier)
-    print(f"  Dataset: {len(X)} games, {X.shape[1]} features, "
+    # Phase 1: precompute safe features (per-season, no cross-season leakage)
+    print("  Building matchup data...")
+    matchup_df, team_stats = build_matchup_rows()
+
+    y = matchup_df["Label"].astype(int)
+    seasons = matchup_df["Season"]
+
+    # Precompute seed diffs for upset detection (safe: seeds are per-season)
+    diff_df = compute_matchup_differentials(matchup_df, team_stats)
+    merged = matchup_df.merge(diff_df[["Season", "TeamA", "TeamB", "SeedDiff"]],
+                               on=["Season", "TeamA", "TeamB"], how="left")
+    seed_diffs = merged["SeedDiff"].values
+
+    feature_cols = FEATURE_TIERS[feature_tier]
+    avail = [c for c in feature_cols if c in diff_df.columns]
+    print(f"  Dataset: {len(matchup_df)} games, {len(avail)} features, "
           f"{seasons.nunique()} seasons")
-    print(f"  Features: {list(X.columns)}")
+    print(f"  Features: {avail}")
     print(f"  Label balance: {y.mean():.3f} (fraction TeamA wins)")
 
-    # Run CV
+    # Phase 2: pipeline-based CV (features computed per-fold, no leakage)
     model_cls = MODEL_REGISTRY[model_name]
+
+    def pipeline_factory():
+        return make_pipeline(model_cls, model_kwargs, team_stats, feature_tier)
+
+    X = matchup_df[["Season", "TeamA", "TeamB"]]
+
     if cv_method == "loso":
         print(f"  Running leave-one-season-out CV...")
-        cv_results = leave_one_season_out_cv(model_cls, model_kwargs, X, y, seasons)
+        cv_results = leave_one_season_out_cv(
+            X=X, y=y, seasons=seasons, seed_diffs=seed_diffs,
+            pipeline_factory=pipeline_factory)
     elif cv_method == "walk_forward":
         test_seasons = sorted(seasons.unique())[-3:]
         print(f"  Running walk-forward CV (test seasons: {list(test_seasons)})...")
-        cv_results = walk_forward_cv(model_cls, model_kwargs, X, y, seasons,
-                                     test_seasons=list(test_seasons))
+        cv_results = walk_forward_cv(
+            X=X, y=y, seasons=seasons, seed_diffs=seed_diffs,
+            test_seasons=list(test_seasons), pipeline_factory=pipeline_factory)
     else:
         win_label = f"window={window_size}" if window_size else "expanding"
         print(f"  Running sliding window CV ({win_label}, min 5 train seasons)...")
-        cv_results = sliding_window_cv(model_cls, model_kwargs, X, y, seasons,
-                                       window_size=window_size, min_train_seasons=5)
+        cv_results = sliding_window_cv(
+            X=X, y=y, seasons=seasons, seed_diffs=seed_diffs,
+            window_size=window_size, min_train_seasons=5,
+            pipeline_factory=pipeline_factory)
 
     overall = cv_results["overall"]
     print(f"\n  RESULTS:")
@@ -68,9 +92,10 @@ def run_experiment(model_name: str, model_kwargs: dict, feature_tier: str,
     print(f"    Seasons tested:  {overall['n_seasons']}")
 
     # Train final model on all data for feature importance
-    model = model_cls(**model_kwargs)
-    model.fit(X, y)
-    feature_importance = model.get_feature_importance(list(X.columns))
+    pipe = pipeline_factory()
+    pipe.fit(X, y)
+    inner_model = pipe.named_steps["model"].model_
+    feature_importance = inner_model.get_feature_importance(avail)
 
     if feature_importance:
         print(f"\n  Feature Importance (top 5):")
@@ -80,12 +105,13 @@ def run_experiment(model_name: str, model_kwargs: dict, feature_tier: str,
 
     # Log to MLflow
     run_name = f"{model_name}_{feature_tier}"
-    log_experiment(run_name, model.get_params(), feature_tier, cv_results, feature_importance)
+    log_experiment(run_name, inner_model.get_params(), feature_tier,
+                   cv_results, feature_importance)
 
     # Save model
     if save:
-        save_model(model, model_name, feature_tier, cv_results, model_kwargs,
-                   list(X.columns), cv_method=cv_method)
+        save_model(inner_model, model_name, feature_tier, cv_results, model_kwargs,
+                   avail, cv_method=cv_method)
 
     return cv_results
 
@@ -96,7 +122,7 @@ def main():
                         help="Feature tier (seed_only, base, base_massey, full, "
                              "efficiency, efficiency_4f, adj_efficiency, adj_efficiency_4f)")
     parser.add_argument("--model", type=str, default=None,
-                        help="Model type (logistic, xgboost)")
+                        help="Model type (logistic, xgboost, stacking)")
     parser.add_argument("--cv", type=str, default="sliding",
                         choices=["sliding", "walk_forward", "loso"],
                         help="CV method (default: sliding)")

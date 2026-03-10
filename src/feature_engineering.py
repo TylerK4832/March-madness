@@ -277,47 +277,32 @@ def add_massey_features(team_stats: pd.DataFrame) -> pd.DataFrame:
     return team_stats.merge(pivot, on=["Season", "TeamID"], how="left")
 
 
-def build_matchup_features(feature_tier: str = "full") -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """Build the full training dataset: matchup differentials for tournament games.
+def compute_matchup_differentials(matchup_df: pd.DataFrame,
+                                   team_stats: pd.DataFrame) -> pd.DataFrame:
+    """Compute TeamA - TeamB differential features for matchup rows.
+
+    Args:
+        matchup_df: DataFrame with Season, TeamA, TeamB columns.
+        team_stats: DataFrame with per-team-season stats (from build_team_season_stats
+                    + add_seed_features + add_massey_features).
 
     Returns:
-        X: DataFrame of features (differentials)
-        y: Series of labels (1 if lower TeamID won)
-        seasons: Series of season for each row (for CV splits)
+        DataFrame with all differential feature columns plus Season, TeamA, TeamB.
     """
-    from config import FEATURE_TIERS
-
-    # Build team-season aggregates
-    team_stats = build_team_season_stats()
-    team_stats = add_seed_features(team_stats)
-    team_stats = add_massey_features(team_stats)
-
-    # Load tournament games
-    tourney = load_tourney_detailed()
+    # Index team stats for fast lookup
+    stats_idx = team_stats.set_index(["Season", "TeamID"])
 
     rows = []
-    for _, game in tourney.iterrows():
-        season = game["Season"]
-        w_id = game["WTeamID"]
-        l_id = game["LTeamID"]
+    for _, m in matchup_df.iterrows():
+        season, team_a, team_b = int(m["Season"]), int(m["TeamA"]), int(m["TeamB"])
 
-        # Symmetric encoding: lower ID is always TeamA
-        team_a = min(w_id, l_id)
-        team_b = max(w_id, l_id)
-        label = 1 if w_id == team_a else 0
-
-        a_stats = team_stats[(team_stats["Season"] == season) &
-                             (team_stats["TeamID"] == team_a)]
-        b_stats = team_stats[(team_stats["Season"] == season) &
-                             (team_stats["TeamID"] == team_b)]
-
-        if a_stats.empty or b_stats.empty:
+        try:
+            a = stats_idx.loc[(season, team_a)]
+            b = stats_idx.loc[(season, team_b)]
+        except KeyError:
             continue
 
-        a = a_stats.iloc[0]
-        b = b_stats.iloc[0]
-
-        row = {"Season": season, "TeamA": team_a, "TeamB": team_b, "Label": label}
+        row = {"Season": season, "TeamA": team_a, "TeamB": team_b}
 
         # Seed differential
         a_seed = a.get("SeedNum", 8)
@@ -328,7 +313,7 @@ def build_matchup_features(feature_tier: str = "full") -> tuple[pd.DataFrame, pd
             b_seed = 8
         row["SeedDiff"] = b_seed - a_seed  # positive = A has better seed
 
-        # Box score differentials
+        # Box score differentials (A - B)
         for stat in ["WinPct", "ScoreMargin", "FGPct", "FG3Pct", "FTPct",
                       "OR", "DR", "Ast", "TO", "Stl", "Blk"]:
             a_val = a.get(stat, 0)
@@ -349,7 +334,7 @@ def build_matchup_features(feature_tier: str = "full") -> tuple[pd.DataFrame, pd
                 b_val = 180
             row[f"{col}Diff"] = b_val - a_val  # positive = A ranked better
 
-        # Derived differentials
+        # Derived differentials (A - B)
         for stat in ["TOMargin", "RebMargin", "SoSProxy",
                       "OE", "DE", "NetEff", "eFGPct", "TOPct", "ORPct", "FTRate",
                       "AdjOE", "AdjDE", "AdjNetEff",
@@ -365,9 +350,54 @@ def build_matchup_features(feature_tier: str = "full") -> tuple[pd.DataFrame, pd
 
         rows.append(row)
 
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+def build_matchup_rows() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build raw matchup rows from tournament games and precomputed team stats.
+
+    Returns:
+        matchup_df: DataFrame with Season, TeamA, TeamB, Label columns.
+        team_stats: DataFrame with all per-team-season stats.
+    """
+    team_stats = build_team_season_stats()
+    team_stats = add_seed_features(team_stats)
+    team_stats = add_massey_features(team_stats)
+
+    tourney = load_tourney_detailed()
+    rows = []
+    for _, game in tourney.iterrows():
+        w_id, l_id = game["WTeamID"], game["LTeamID"]
+        team_a = min(w_id, l_id)
+        team_b = max(w_id, l_id)
+        rows.append({
+            "Season": game["Season"],
+            "TeamA": team_a,
+            "TeamB": team_b,
+            "Label": 1 if w_id == team_a else 0,
+        })
+
+    return pd.DataFrame(rows), team_stats
+
+
+def build_matchup_features(feature_tier: str = "full") -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Build the full training dataset: matchup differentials for tournament games.
+
+    Returns:
+        X: DataFrame of features (differentials)
+        y: Series of labels (1 if lower TeamID won)
+        seasons: Series of season for each row (for CV splits)
+    """
+    from config import FEATURE_TIERS
+
+    matchup_df, team_stats = build_matchup_rows()
+    df = compute_matchup_differentials(matchup_df, team_stats)
+
+    # Merge labels back (differentials may drop rows with missing stats)
+    df = df.merge(matchup_df[["Season", "TeamA", "TeamB", "Label"]],
+                  on=["Season", "TeamA", "TeamB"])
+
     feature_cols = FEATURE_TIERS[feature_tier]
-    # Only use columns that exist
     available = [c for c in feature_cols if c in df.columns]
 
     X = df[available].astype(float)

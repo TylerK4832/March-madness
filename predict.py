@@ -13,70 +13,11 @@ import pandas as pd
 sys.path.insert(0, ".")
 
 from config import FEATURE_TIERS
-from src.feature_engineering import build_team_season_stats, add_seed_features, add_massey_features
+from src.feature_engineering import build_matchup_rows
 from src.data_loader import load_seeds
 from src.models import MODEL_REGISTRY
+from src.pipeline import make_pipeline
 from src.bracket import generate_chalk_bracket, generate_pool_optimized_bracket
-
-
-def build_tournament_matchup_probs(model, team_stats, feature_cols, season, tourney_team_ids):
-    """Build probability predictions for all pairwise matchups among tournament teams."""
-    season_teams = team_stats[team_stats["Season"] == season]
-    seeds_df = load_seeds()
-    season_seeds = seeds_df[seeds_df["Season"] == season]
-    seed_lookup = dict(zip(season_seeds["TeamID"], season_seeds["SeedNum"]))
-
-    # Pre-index team stats
-    stats_lookup = {}
-    for tid in tourney_team_ids:
-        rows = season_teams[season_teams["TeamID"] == tid]
-        if len(rows) > 0:
-            stats_lookup[tid] = rows.iloc[0]
-
-    # Build all features in a batch
-    batch_rows = []
-    pair_keys = []
-    for i, team_a in enumerate(tourney_team_ids):
-        if team_a not in stats_lookup:
-            continue
-        for team_b in tourney_team_ids[i + 1:]:
-            if team_b not in stats_lookup:
-                continue
-
-            a_stats = stats_lookup[team_a]
-            b_stats = stats_lookup[team_b]
-            a_seed = seed_lookup.get(team_a, 8)
-            b_seed = seed_lookup.get(team_b, 8)
-
-            row = {"SeedDiff": b_seed - a_seed}
-
-            for stat in ["WinPct", "ScoreMargin", "FGPct", "FG3Pct", "FTPct",
-                          "OR", "DR", "Ast", "TO", "Stl", "Blk"]:
-                a_val = a_stats.get(stat, 0)
-                b_val = b_stats.get(stat, 0)
-                row[f"{stat}Diff"] = (a_val if not pd.isna(a_val) else 0) - (b_val if not pd.isna(b_val) else 0)
-
-            for col in ["OrdinalKenPom", "OrdinalSagarin"]:
-                a_val = a_stats.get(col, 180)
-                b_val = b_stats.get(col, 180)
-                row[f"{col}Diff"] = (b_val if not pd.isna(b_val) else 180) - (a_val if not pd.isna(a_val) else 180)
-
-            for stat in ["TOMargin", "RebMargin", "SoSProxy",
-                         "OE", "DE", "NetEff", "eFGPct", "TOPct", "ORPct", "FTRate",
-                         "AdjOE", "AdjDE", "AdjNetEff"]:
-                a_val = a_stats.get(stat, 0)
-                b_val = b_stats.get(stat, 0)
-                row[f"{stat}Diff"] = (a_val if not pd.isna(a_val) else 0) - (b_val if not pd.isna(b_val) else 0)
-
-            batch_rows.append(row)
-            pair_keys.append((team_a, team_b))
-
-    # Predict all at once
-    available = [c for c in feature_cols if c in batch_rows[0]]
-    X = pd.DataFrame(batch_rows)[available]
-    probs = model.predict_proba(X)
-
-    return dict(zip(pair_keys, probs))
 
 
 def main():
@@ -88,28 +29,20 @@ def main():
                         choices=["chalk", "pool"])
     args = parser.parse_args()
 
-    from src.feature_engineering import build_matchup_features
-
-    feature_cols = FEATURE_TIERS[args.tier]
+    # Build data
+    print(f"Building features (tier: {args.tier})...")
+    matchup_df, team_stats = build_matchup_rows()
 
     # Train on all seasons except the target
-    print(f"Building features (tier: {args.tier})...")
-    X, y, seasons = build_matchup_features(args.tier)
-
-    train_mask = seasons != args.season
-    X_train = X[train_mask]
-    y_train = y[train_mask]
+    train_mask = matchup_df["Season"] != args.season
+    X_train = matchup_df[train_mask][["Season", "TeamA", "TeamB"]]
+    y_train = matchup_df[train_mask]["Label"].astype(int)
 
     print(f"Training {args.model} on {len(X_train)} games...")
     model_cls = MODEL_REGISTRY[args.model]
     model_kwargs = {"n_estimators": 200, "max_depth": 4, "learning_rate": 0.05} if args.model == "xgboost" else {}
-    model = model_cls(**model_kwargs)
-    model.fit(X_train, y_train)
-
-    # Build team stats for the target season
-    team_stats = build_team_season_stats()
-    team_stats = add_seed_features(team_stats)
-    team_stats = add_massey_features(team_stats)
+    pipe = make_pipeline(model_cls, model_kwargs, team_stats, args.tier)
+    pipe.fit(X_train, y_train)
 
     # Get tournament teams for target season
     seeds_df = load_seeds()
@@ -121,11 +54,24 @@ def main():
     seed_map = dict(zip(season_seeds["TeamID"], season_seeds["SeedNum"]))
     tourney_teams = sorted(season_seeds["TeamID"].unique())
 
-    # Build pairwise probabilities (only among tournament teams)
+    # Build all pairwise matchup rows
     print(f"Computing matchup probabilities for {len(tourney_teams)} teams...")
-    matchup_probs = build_tournament_matchup_probs(
-        model, team_stats, feature_cols, args.season, tourney_teams
-    )
+    pair_rows = []
+    for i, team_a in enumerate(tourney_teams):
+        for team_b in tourney_teams[i + 1:]:
+            pair_rows.append({
+                "Season": args.season,
+                "TeamA": team_a,
+                "TeamB": team_b,
+            })
+
+    X_pred = pd.DataFrame(pair_rows)
+    probs = pipe.predict_proba(X_pred)[:, 1]
+
+    matchup_probs = {}
+    for idx, row in X_pred.iterrows():
+        matchup_probs[(int(row["TeamA"]), int(row["TeamB"]))] = probs[idx]
+
     print(f"  {len(matchup_probs)} matchup probabilities computed.")
 
     # Order teams by seed for bracket
